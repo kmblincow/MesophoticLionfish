@@ -1,0 +1,251 @@
+---
+title: "Telemetry QA/QC Guidance"
+author: "Kayla Blincow"
+date: "4/22/2022"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+Telemetry data can be prone to weirdnesses; we can have issues with code collisions and dropped tags, among other things. For this reason, it's a good idea to do some pre-processing of the data to make sure you are only including valid detections in your subsequent analyses.
+
+This file will help walk you through some of the most important things to check for; however, many of these steps are project specific, so you should adjust this code according to your specific needs. Maybe you know there was a mistake during the download process that may not have been addressed, or maybe your species naturally travels longer distances than others studied at UVI--it's your responsibility to account for these things as you work through this process. 
+
+It is also possible that some of the things covered in this code are not applicable to your project. For example, if you were trying to determine the response of an animal to tagging procedures, you probably wouldn't want to remove the first day or two of detections (which is pretty standard for other studies to avoid tagging impacts biasing your results). Don't lose sight of what research questions you are trying to answer and think critically about how each of the steps covered here might influence your ability to answer those questions.
+
+One final note: I am omitting a lot of the checks I do in the console to make sure the data processing steps are working properly to save space (e.g. head(), str(), summary(), etc.). You should do these things! Make sure the code is doing what you think it's doing!
+
+Okay! Let's do this!
+
+## Setting Up
+I am going to use Dr. Stephen Ratchford's hermit crab tags as an example for implementing the QA/QC process. This data is already stored in my working environment. It's a good idea to start an R project folder for your data analysis and store your raw data files there. That way they are all in one place and you don't have to manually update your working directory every time you want to pull new data. 
+
+In addition to our detection data, we are also going to load the UVI Master Transmitter File which has metadata about the type of tags and their deployment.
+
+```{r, results = 'hide', warning = FALSE, message = FALSE}
+#load necessary packages
+library(tidyverse)
+library(lubridate)
+library(geosphere)
+
+#load your data (file path is specific to my working directory)
+d <- read.csv("Data/DeepLionfishCombo.csv", header = T)
+
+#load the master transmitter file
+tagdata <-  read.csv("uvi_transmitter_master_20191028.csv", header = T)
+
+```
+
+It's always a good idea to check your data to make sure it makes sense, and that somebody (aka me :) ) didn't make a mistake when they were processing the raw VUE data files.
+
+```{r}
+head(d) #do the column headers and data line up? is there supposed to be sensor information?
+
+unique(d$transmitter) #is this the right number of tags? the right codes?
+
+str(d) #are the columns in the right format? esp. date_time?
+
+#convert detection_time_ast to a time object
+d$detection_time_ast <- ymd_hms(d$detection_time_ast)
+```
+
+
+## 1. Removing the first day (or two) of detections.
+As mentioned earlier, it's generally standard practice to remove the first one to two days of detections post-tagging as the tagging procedure can impact the animal's behavior and bias your analysis. You hopefully have some intuition or literature-based evidence on how long tagging procedures might influence the behavior of your specific study species, and you should adjust the code below accordingly.
+
+For hermit crabs, I suspect that they are not likely to be too phased by tagging procedures as it's a minimally invasive procedure (attaching tags to their shells), so I would normally just remove the first day of detections. This case is a little weird, because the release date of these animals was not recorded. So we are going to assume the first detection for each animal occurred on the day it was released, and remove all detections within 24 hours of the first detection. 
+
+
+For your projects, you hopefully recorded the release date information and you use the UVI Master Transmitter file (loaded in the beginning) to filter your detections based on the ReleaseDate column (below is the code to do that...).
+
+```{r}
+#convert the RelaseDate column to date format
+tagdata$ReleaseDate <- dmy(tagdata$release_date_CAN)
+
+#Join the tag data with the detection data
+d2 <- left_join(d, tagdata, by = c("transmitter" = "Transmitter"))
+
+#filter for detections 24 hours after release date 
+d2 <- filter(d2, date(detection_time_ast) > (ReleaseDate + 1))
+
+#run some checks to make sure this worked in the console :)
+```
+
+Sweet! So we've removed the first chunk of detections to avoid the effects of tagging procedure bias! Now we can move on to the next step.
+
+## 2. Filtering detections that occur at a more rapid pace than your ping rate.
+Sometimes receivers record erroneous detections. This can happen for a number of reasons, including when many tags are reporting at the same receiver and their pings "collide" resulting in the receiver recording a mish-mash that it associates with a different tag (this is what we call code collisions). 
+
+One way to identify these erroneous detections is to look for instances where the time difference between detections is faster than the minimum tag delay. The tags are programmed to ping across a range of tag delays, so if they record a detection faster than the minimum of their delay range, you know that is a false detection.
+
+The way we will do this is to calculate the time between subsequent detections at the same receiver and then flag those that occur faster than the minimum tag delay. The minimum tag delay information will be stored in the UVI Master Transmitter file. 
+
+NOTE: If you are working with a receiver array where a tag can be detected at more than one receiver at once, it is important that you do these calculations by receiver or station. In cases with VPS arrays, you will ideally have a lot of detections where the time difference is lower than the ping rate, because the tag is registering on multiple receivers.
+
+```{r}
+#calculate the time difference between pings for each tag
+d2 <- d2 %>% arrange(detection_time_ast) %>% 
+  group_by(transmitter, station) %>% 
+  mutate(det_diff = detection_time_ast - lag(detection_time_ast))
+
+#convert det_diff to integer to make things easier
+d2$det_diff <- as.integer(d2$det_diff)
+
+#flag detections that are faster than minimum delay
+d2$delayflag <- "fine"
+
+d2[!is.na(d2$det_diff) & d2$det_diff < d2$Min_Delay,]$delayflag <- "flag"
+
+unique(d2$delayflag) #if this returns anything other than "fine", then you've got false detections
+
+head(d2) 
+
+d2[d2$delayflag == "flag",]
+```
+
+If you have any detections that are flagged you should take a closer look at those detections. Make sure the code worked properly and verify that the flagged detections are in fact false detections. Once you're sure that the detections are erroneous run the below code to filter those detections out.
+
+```{r}
+#remove false detections
+d2 <- filter(d2, delayflag != "flag")
+```
+
+
+## 3. Dealing with dropped tags and dead animals.
+Another issue we need to deal with is "dropped tags". This can happen when the animal physically drops their tag. This is more common with tags that are attached externally (the turtle folks know what I'm talkin' bout ;) ), but it can also happen when tags are surgically implanted. Sometimes the sutures don't hold and the tag can pop out. A similar situation is when the animal dies. Both of these cases result in a tag sitting stationary and pinging consistently at the same receiver(s). 
+
+These detections are obviously not giving us information on the animal's movement, so we want to remove them. You need to be careful here though, especially if you are working with a critter that doesn't move all that much and/or is a homebody. You don't want to remove a bunch of detections only to find out your animal was actually just chilling, then started moving again. 
+
+There are two main ways we identify dropped tags. First, we will look at how the animal interacts with the array during a time period that we are pretty confident it was actually active (i.e. the beginning of the detection hisotry), then we will compare that to the tail end of their detection history to see if somewhere along the line the tag dropped. Generally dropped tags will look like continuous detections at one or a few receivers at the tail end of the detection history. Second, we will look at the daily detection count across receivers. Generally animals that are active will have more variable daily detections than dropped tags. 
+
+NOTE: This process is a lot easier when you have fewer tags, since it relies partially on looking at plots visually. If you are working on a project with a lot of tags, I suggest first applying a filter to try to identify potential dropped tags (such as filtering for tags that display a marked drop in number of receivers), then going from there. Or batching your plots so that you are looking a manageable number of them at a time.
+
+```{r}
+#plot detections across array for each animal
+ggplot(d2, aes(x = detection_time_ast, y = station, color = transmitter)) +
+  geom_point() +
+  facet_wrap(~transmitter)
+
+#could be some dropped tags...
+```
+
+```{r}
+#plot daily detection count through time for each tag (across all receivers)
+d_cnt <- d2 %>% 
+  group_by(transmitter, date(detection_time_ast)) %>% 
+  summarize(n_det = n()) %>% 
+  rename(Date = `date(detection_time_ast)`)
+
+ggplot(d_cnt, aes(x = Date, y = n_det, color = transmitter)) +
+  geom_point() +
+  facet_wrap(~transmitter)
+
+#5411, 5412, 5416? 1230, 1231?
+```
+
+
+```{r, eval = FALSE}
+#need to filter out the dropped tag periods
+#need find day the tag dropped then filter
+#NOTE: less than 3 receivers may or may not be appropriate for your study
+dropdates <- d2 %>%
+  arrange(detection_time_ast) %>% #THIS WAS IMPORTANT!
+  mutate(Date = date(detection_time_ast)) %>% 
+  group_by(transmitter, Date) %>% 
+  summarize(drop = n_distinct(station)) %>% 
+  filter(drop > 1) %>% #filtering for days when tag was detected on less than 1 receiver
+  summarize(firstday = max(Date))
+dropdates
+
+d2 %>% 
+  group_by(transmitter) %>% 
+  summarize(min = min(detection_time_ast),
+            max = max(detection_time_ast))
+
+#filter for detections that occurred before the drop date
+d2$inout <- "in"
+
+for(i in 1:nrow(dropdates)){
+  d2[d2$transmitter == dropdates$transmitter[i] & 
+          date(d2$detection_time_ast) > dropdates$firstday[i],]$inout <- "out"
+}
+
+
+d2$inout <- as.factor(d2$inout)
+
+#now filter out the "outs"
+d2 <- filter(d2, inout == "in")
+```
+
+
+## 4. Determining if your detections jive with your critter's ecology.
+
+All of the things we have dealt with so far have been pretty straightforward. Unfortunately, not all data weirdnesses are so cut and dry. One example is predation effects. If your animal gets eaten, it's possible the tag will still be swimming around pretending to be your critter when it actuality it's a completely different critter!
+
+It's important to check that your tags are not doing anything that doesn't make sense given the ecology of your study species. I'm going to focus on looking at movement rates, especially in respect to distance traveled, but depending on your specific study animal, it might make sense to do some other checks. This is another one of those areas where you will have to think about your own study and make sure that you are accounting for potential hiccups accordingly.
+
+NOTE: The below code is just a quick and dirty look at movement rates. If you actually wanted to calculate movement rates for analysis purposes, you will probably going to want to go about it a different way (especially if you are working with VPS data-though you will hopefully have actual position estimates from that).
+```{r}
+#calculate distance and time between detections to calculate movement rates
+
+#distance between detections
+dist <- d2 %>% 
+  arrange(transmitter, detection_time_ast) %>% 
+  group_by(transmitter) %>% 
+  group_map(~ c(NA, distHaversine(cbind(.x$long_nad83, .x$lat_nad83))), keep = T) %>% 
+  unlist()
+
+#add that as a new column, calculate time difference, and movement rate
+test <- d2 %>% ungroup() %>% 
+  arrange(transmitter, detection_time_ast) %>% 
+  mutate(Dist = dist) %>% 
+  group_by(transmitter) %>% 
+  mutate(difftime = as.numeric(detection_time_ast - lag(detection_time_ast)),
+         mvmt_rate = Dist/difftime)
+
+test
+#let's take a look at the movement rates we calculated and see if they make sense
+#NOTE: based on the code above the movement rate will be in m/s
+#NOTE 2.0: This is VPS data, so we will have some weirdnesses with tags detected 
+#at multiple receivers, but we can still use this as a rough estimate
+hist(test$mvmt_rate)
+
+#whelp... we've got some weirdly high values... 
+
+
+#I suspect this is from overlapping VPS receivers, for this reason, we will filter 
+#our data to only look at detections more than the minimum tag delay apart
+test2 <- filter(test, difftime > Min_Delay) 
+
+hist(test2$mvmt_rate)
+#this seems a lot more reasonable, especially considering we aren't accounting for
+#receiver detection ranges.
+```
+
+
+## 5. Other considerations.
+These are the basics, but as I mentioned previously, you might want to add additional post-processing QA/QC steps. For example, if you know a tag was dropped then re-attached to the same animal, you will have to make choices about how to handle that. Don't lose sight of your research questions and think critically about how each of these steps might influence your data.
+
+The last thing you should do is save the final output file as your "clean" dataset that you can then use to do your analysis.
+```{r}
+#remove unnecessary columns
+d2 <- select(d2, -X, -det_diff, -delayflag,
+             -tag_serial.x:tag_serial.y, -release_date_CAN:release_year,
+             -Researcher.Owner:multi_use_code)
+#don't want to go back and run all the code again, so I'm going to just do this
+#again...
+d2 <- select(d2, station:tag_serial.x, tag_model, release_site:animal_end_date,
+             ReleaseDate)
+write_rds(d2, "DeepLionfish_clean.rds")
+```
+
+
+Good luck! Feel free to reach out if you have questions about any of this code.
+
